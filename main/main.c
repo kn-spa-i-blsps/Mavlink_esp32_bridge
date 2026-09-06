@@ -4,13 +4,14 @@
  * - UART1 on the GPIO matrix (pick free pins), 3.3V TTL straight to a FC TELEM port
  * - Sends HEARTBEAT at 1 Hz  (FC ignores commands from a link it thinks is dead)
  * - Parses RX: locks target sysid/compid from the FC's HEARTBEAT, logs COMMAND_ACK
- * - Demo command: MAV_CMD_REQUEST_MESSAGE (harmless, returns an ACK -> proves the pipe)
+ * - Once the FC is seen, sends the hardcoded command list below, one every 2s
  *
  * MAVLink C headers (c_library_v2, ardupilotmega dialect) must be added as a component.
  * See notes below the file for CMakeLists + FC-side SERIALn params.
  */
 
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/uart.h"
@@ -34,9 +35,28 @@ static const char *TAG = "mav";
 #define OWN_COMPID      MAV_COMP_ID_ONBOARD_COMPUTER   /* 191 */
 
 /* learned from the FC's heartbeat before we send anything targeted */
-static uint8_t  g_target_sys  = 0;
-static uint8_t  g_target_comp = 0;
-static bool     g_link_up     = false;
+static uint8_t  g_target_sys   = 0;
+static uint8_t  g_target_comp  = 0;
+static bool     g_link_up      = false;
+static uint32_t g_flight_mode  = 0;   /* HEARTBEAT.custom_mode, refreshed every heartbeat */
+
+/* ArduCopter custom_mode -> human name (see ardupilotmega.h enum COPTER_MODE) */
+static const char *copter_mode_name(uint32_t mode)
+{
+    switch (mode) {
+    case COPTER_MODE_STABILIZE: return "STABILIZE";
+    case COPTER_MODE_ACRO:      return "ACRO";
+    case COPTER_MODE_ALT_HOLD:  return "ALT_HOLD";
+    case COPTER_MODE_AUTO:      return "AUTO";
+    case COPTER_MODE_GUIDED:    return "GUIDED";
+    case COPTER_MODE_LOITER:    return "LOITER";
+    case COPTER_MODE_RTL:       return "RTL";
+    case COPTER_MODE_LAND:      return "LAND";
+    case COPTER_MODE_POSHOLD:   return "POSHOLD";
+    case COPTER_MODE_BRAKE:     return "BRAKE";
+    default:                    return "OTHER";
+    }
+}
 
 static void uart_init(void)
 {
@@ -73,19 +93,33 @@ static void send_heartbeat(void)
     mav_send(&msg);
 }
 
-/* Demo: ask the FC to emit AUTOPILOT_VERSION once. Returns a COMMAND_ACK, moves nothing. */
-static void request_autopilot_version(void)
+/* One MAV_CMD_* to send via COMMAND_LONG, with its 7 params. */
+typedef struct {
+    uint16_t cmd;
+    float    param[7];
+} mav_cmd_t;
+
+/* ---- hardcoded command sequence -> edit this to whatever the FC should do ---- */
+static const mav_cmd_t g_commands[] = {
+    /* ask the FC to emit AUTOPILOT_VERSION once (harmless, proves the pipe) */
+    { MAV_CMD_REQUEST_MESSAGE, { MAVLINK_MSG_ID_AUTOPILOT_VERSION, 0, 0, 0, 0, 0, 0 } },
+    /* ask the FC to emit SYS_STATUS once */
+    { MAV_CMD_REQUEST_MESSAGE, { MAVLINK_MSG_ID_SYS_STATUS, 0, 0, 0, 0, 0, 0 } },
+    /* stream ATTITUDE (roll/pitch/yaw + timestamp) continuously at 1 Hz */
+    { MAV_CMD_SET_MESSAGE_INTERVAL, { MAVLINK_MSG_ID_ATTITUDE, 1000000, 0, 0, 0, 0, 0 } },
+};
+#define NUM_COMMANDS (sizeof(g_commands) / sizeof(g_commands[0]))
+
+static void send_command(const mav_cmd_t *c)
 {
     mavlink_message_t msg;
     mavlink_msg_command_long_pack(OWN_SYSID, OWN_COMPID, &msg,
         g_target_sys, g_target_comp,
-        MAV_CMD_REQUEST_MESSAGE,          /* 512 */
-        0,                                /* confirmation */
-        (float)MAVLINK_MSG_ID_AUTOPILOT_VERSION, /* param1 = requested msg id (148) */
-        0, 0, 0, 0, 0, 0);
+        c->cmd, 0 /* confirmation */,
+        c->param[0], c->param[1], c->param[2], c->param[3],
+        c->param[4], c->param[5], c->param[6]);
     mav_send(&msg);
-    ESP_LOGI(TAG, "-> REQUEST_MESSAGE(AUTOPILOT_VERSION) to %u/%u",
-             g_target_sys, g_target_comp);
+    ESP_LOGI(TAG, "-> command %u to %u/%u", c->cmd, g_target_sys, g_target_comp);
 }
 
 static void handle_message(const mavlink_message_t *msg)
@@ -93,16 +127,33 @@ static void handle_message(const mavlink_message_t *msg)
     switch (msg->msgid) {
 
     case MAVLINK_MSG_ID_HEARTBEAT: {
-        /* Lock onto the autopilot component only (compid 1), not other GCS/companions */
-        if (!g_link_up && msg->compid == MAV_COMP_ID_AUTOPILOT1) {
-            mavlink_heartbeat_t hb;
-            mavlink_msg_heartbeat_decode(msg, &hb);
+        /* Only the autopilot component (compid 1), not other GCS/companions on the bus */
+        if (msg->compid != MAV_COMP_ID_AUTOPILOT1) {
+            break;
+        }
+        mavlink_heartbeat_t hb;
+        mavlink_msg_heartbeat_decode(msg, &hb);
+        g_flight_mode = hb.custom_mode;   /* refreshed every heartbeat, not just the first */
+
+        if (!g_link_up) {
             g_target_sys  = msg->sysid;
             g_target_comp = msg->compid;
             g_link_up     = true;
             ESP_LOGI(TAG, "FC heartbeat: sys=%u comp=%u type=%u ap=%u -> link up",
                      g_target_sys, g_target_comp, hb.type, hb.autopilot);
         }
+        break;
+    }
+
+    case MAVLINK_MSG_ID_ATTITUDE: {
+        mavlink_attitude_t att;
+        mavlink_msg_attitude_decode(msg, &att);
+        ESP_LOGI(TAG, "ATTITUDE t=%lu ms roll=%.1f pitch=%.1f yaw=%.1f deg mode=%s",
+                 (unsigned long)att.time_boot_ms,
+                 att.roll  * (180.0f / (float)M_PI),
+                 att.pitch * (180.0f / (float)M_PI),
+                 att.yaw   * (180.0f / (float)M_PI),
+                 copter_mode_name(g_flight_mode));
         break;
     }
 
@@ -135,7 +186,8 @@ static void mavlink_task(void *arg)
     uint8_t buf[256];
 
     int64_t last_hb_us  = 0;
-    int64_t last_req_us = 0;
+    int64_t last_cmd_us = 0;
+    size_t  next_cmd    = 0;
 
     while (1) {
         /* --- RX: drain whatever is available, parse byte by byte --- */
@@ -154,10 +206,11 @@ static void mavlink_task(void *arg)
             last_hb_us = now;
         }
 
-        /* --- demo command every 5 s, only once the FC is known --- */
-        if (g_link_up && now - last_req_us >= 5000000) {
-            request_autopilot_version();
-            last_req_us = now;
+        /* --- walk the hardcoded command list, one every 2 s, once the FC is known --- */
+        if (g_link_up && next_cmd < NUM_COMMANDS && now - last_cmd_us >= 2000000) {
+            send_command(&g_commands[next_cmd]);
+            next_cmd++;
+            last_cmd_us = now;
         }
     }
 }
