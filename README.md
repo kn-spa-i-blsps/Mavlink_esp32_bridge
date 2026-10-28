@@ -1,158 +1,97 @@
 # mav_ardupilot
 
-ESP32-S3 &lt;-&gt; ArduPilot MAVLink2 bridge, built on ESP-IDF. The ESP32 acts as a
-standalone companion computer wired directly to a flight controller's TELEM
-port: it keeps the link alive with a 1 Hz `HEARTBEAT`, locks onto the FC's
-sysid/compid, and drives the FC through a hardcoded list of MAVLink commands
-defined in [main/main.c](main/main.c).
+Transparent MAVLink-over-WiFi bridge on two Seeed XIAO ESP32S3 boards
+(ESP-IDF). The pair replaces a set of telemetry radios:
 
-## Hardware
+```
+laptop --USB-- [GROUND: WiFi AP] ~~WiFi / UDP 14550~~ [DRONE: WiFi STA] --UART 115200-- flight controller
+```
 
-- ESP32-S3 dev board.
-- ArduPilot flight controller with a free `SERIALn` (TELEM) port.
-- Wiring (crossed, common ground):
+Bytes are relayed as-is (MAVLink is not parsed), so QGroundControl,
+MAVProxy or pymavlink talk to the FC as if it were plugged in directly.
+Both boards run the same firmware; the role is chosen at build time.
 
-  | ESP32-S3      | FC TELEM port |
-  |---------------|---------------|
-  | GPIO17 (TX)   | RX            |
-  | GPIO18 (RX)   | TX            |
-  | GND           | GND           |
+- **GROUND** — WiFi access point (`mavbridge`, channel 1, WPA2,
+  192.168.4.1, at most 1 client). MAVLink goes over the board's native USB
+  (USB-Serial-JTAG, shows up as `/dev/ttyACM*`; baud rate is ignored).
+  Logs go to UART0 so the USB port carries nothing but MAVLink.
+- **DRONE** — joins the AP and sends UDP to 192.168.4.1:14550. MAVLink goes
+  over UART1 to the FC; UDP packets from any address other than the ground
+  board are dropped. Logs go to USB, including a `FC -> N bytes in the last
+  2 s` line every 2 s that confirms the FC wiring.
 
-  Pins are `#define`d at the top of `main.c` (`PIN_TX`/`PIN_RX`) if your board
-  needs different ones.
+## Wiring (drone side)
 
-## FC-side configuration
+| XIAO ESP32S3      | FC (Kakute H7 Mini, UART4) |
+|-------------------|----------------------------|
+| D6 / GPIO43 (TX)  | R4                         |
+| D7 / GPIO44 (RX)  | T4                         |
+| GND               | G                          |
+| 5V                | 5V pad (powered only when the battery is plugged in) |
 
-On the `SERIALn` port you wired up (e.g. TELEM2 = `SERIAL2` on most boards),
-via Mission Planner / QGroundControl:
+Pins and baud rate are `#define`d at the top of [main/main.c](main/main.c)
+(`PIN_TX`, `PIN_RX`, `MAV_BAUD`). The ground board needs only USB.
 
-- `SERIAL2_PROTOCOL = 2` (MAVLink2)
-- `SERIAL2_BAUD = 115` (115200, must match `MAV_BAUD` in `main.c`)
-- `SERIAL2_OPTIONS = 0` (no inversion/swap/half-duplex needed for a normal
-  straight wiring)
+## FC configuration
+
+For the UART used above (SERIAL4 on the Kakute H7 Mini):
+
+- `SERIAL4_PROTOCOL = 2` (MAVLink2)
+- `SERIAL4_BAUD = 115` (115200, must match `MAV_BAUD`)
 
 Reboot the FC after changing these.
 
 ## Building
 
-Requires [ESP-IDF](https://docs.espressif.com/projects/esp-idf/) (developed
-against v5.5.x) targeting `esp32s3`.
+Requires ESP-IDF v5.5.x (tested with v5.5.2) targeting `esp32s3`, and the MAVLink submodule
+(`git clone --recurse-submodules`, or `git submodule update --init
+--recursive`).
+
+Each role has its own build directory and its own generated `sdkconfig`,
+seeded from `sdkconfig.<role>.defaults`. `sdkconfig*` and `build*/` are not
+tracked, so a plain `idf.py build` is **not** the way to build: it would
+produce a default (DRONE) config.
 
 ```bash
-git clone --recurse-submodules <this repo's URL>
-cd mav_ardupilot
-source $IDF_PATH/export.sh
-idf.py build
+source ~/esp/esp-idf/export.sh
+
+idf.py -B build-ground -D SDKCONFIG=sdkconfig.ground -D SDKCONFIG_DEFAULTS=sdkconfig.ground.defaults -D IDF_TARGET=esp32s3 build
+idf.py -B build-drone  -D SDKCONFIG=sdkconfig.drone  -D SDKCONFIG_DEFAULTS=sdkconfig.drone.defaults  -D IDF_TARGET=esp32s3 build
 ```
 
-If you already cloned without `--recurse-submodules`, run
-`git submodule update --init --recursive` first — the MAVLink C headers
-(`components/mavlink/c_library_v2`) are a submodule and the build will fail
-without them.
+The defaults files are only applied when the generated `sdkconfig.<role>`
+does not exist yet; delete it after editing a `.defaults` file.
 
 ## Flashing
 
+The boards are identical, so use the stable `/dev/serial/by-id/` path to
+pick the right one:
+
 ```bash
-idf.py -p /dev/ttyACM0 flash monitor
+idf.py -B build-ground -D SDKCONFIG=sdkconfig.ground -p /dev/serial/by-id/<ground board> flash
+idf.py -B build-drone  -D SDKCONFIG=sdkconfig.drone  -p /dev/serial/by-id/<drone board>  flash monitor
 ```
 
-Adjust the port (`/dev/ttyACM0`/`/dev/ttyACM1` on Linux depending on your
-board). If the monitor gets stuck showing `waiting for download` after
-flashing, press the board's **RESET/EN** button once — this is a known
-ESP32-S3 quirk where the auto-reset sequence sometimes leaves the chip
-latched in USB download mode instead of booting the app.
+If the board stays in `waiting for download` after flashing, press its
+RESET button once.
 
-## What it does
+## Using it
 
-1. Sends `HEARTBEAT` at 1 Hz so the FC treats the link as alive.
-2. Locks onto the FC's sysid/compid from its own `HEARTBEAT` (compid
-   `MAV_COMP_ID_AUTOPILOT1` only, ignoring other GCS/companions that might
-   share the bus).
-3. Once locked, walks a hardcoded list of commands (`g_commands[]`), one
-   every 2 seconds, and logs each resulting `COMMAND_ACK`.
-4. Decodes and logs a few message types it's specifically interested in
-   (`AUTOPILOT_VERSION`, `SYS_STATUS`, `ATTITUDE`) as they arrive.
-
-### Example: pulling live attitude + flight mode from the FC
-
-`g_commands[]` includes an entry that asks the FC to stream `ATTITUDE`
-(roll/pitch/yaw + a boot-relative timestamp) continuously at 1 Hz, using
-`MAV_CMD_SET_MESSAGE_INTERVAL` — the "subscribe" version of the one-shot
-`MAV_CMD_REQUEST_MESSAGE`:
-
-```c
-{ MAV_CMD_SET_MESSAGE_INTERVAL, { MAVLINK_MSG_ID_ATTITUDE, 1000000, 0, 0, 0, 0, 0 } },
+```bash
+# MAVProxy on the ground board, fanned out to QGC (14550) and a script (14551)
+mavproxy.py --master=$(readlink -f /dev/serial/by-id/<ground board>) --baudrate 115200 \
+            --out=udp:127.0.0.1:14550 --out=udp:127.0.0.1:14551 --streamrate=-1
 ```
 
-`param1` is the message ID to stream, `param2` the interval in microseconds
-(1,000,000 = 1 Hz). Every `ATTITUDE` message that arrives afterward is
-decoded and logged alongside the current flight mode, which is tracked
-separately from every `HEARTBEAT.custom_mode`:
+pymavlink and MAVProxy treat a `:` in the device name as `host:port`, and the
+Espressif by-id names contain the MAC address, hence `readlink -f`.
+`--streamrate=-1` stops MAVProxy from sending `REQUEST_DATA_STREAM`, which
+ArduPilot stores in the `SRn_*` parameters; clients request their own
+streams with `SET_MESSAGE_INTERVAL` instead.
 
-```c
-case MAVLINK_MSG_ID_ATTITUDE: {
-    mavlink_attitude_t att;
-    mavlink_msg_attitude_decode(msg, &att);
-    ESP_LOGI(TAG, "ATTITUDE t=%lu ms roll=%.1f pitch=%.1f yaw=%.1f deg mode=%s",
-             (unsigned long)att.time_boot_ms,
-             att.roll  * (180.0f / (float)M_PI),
-             att.pitch * (180.0f / (float)M_PI),
-             att.yaw   * (180.0f / (float)M_PI),
-             copter_mode_name(g_flight_mode));
-    break;
-}
-```
+## WiFi password
 
-Expected log output once the FC accepts the stream request:
-
-```
-I (xxx) mav: ATTITUDE t=12345 ms roll=0.3 pitch=-1.2 yaw=88.4 deg mode=STABILIZE
-I (xxx) mav: ATTITUDE t=13345 ms roll=0.2 pitch=-1.1 yaw=88.6 deg mode=STABILIZE
-```
-
-`copter_mode_name()` maps `HEARTBEAT.custom_mode` to a human-readable
-ArduCopter flight mode name (`STABILIZE`, `GUIDED`, `RTL`, ...) using the
-`COPTER_MODE` enum from the `ardupilotmega` dialect — swap in the
-`PLANE_MODE`/`ROVER_MODE` enum instead if you're bridging a different
-vehicle type.
-
-## Adding your own commands
-
-Edit `g_commands[]` in `main.c` — each entry is a `MAV_CMD_*` plus its 7
-`COMMAND_LONG` params:
-
-```c
-typedef struct {
-    uint16_t cmd;
-    float    param[7];
-} mav_cmd_t;
-```
-
-The list is sent once, in order, 2 seconds apart, starting as soon as the FC
-is seen. A couple of useful ones to try:
-
-- `{ MAV_CMD_DO_SET_MODE, { MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, <custom_mode>, 0,0,0,0,0 } }` — change flight mode.
-- `{ MAV_CMD_COMPONENT_ARM_DISARM, { 1, 0,0,0,0,0,0 } }` — arm the vehicle.
-  **Only test this with propellers removed or on a bench** — it will
-  genuinely arm the FC.
-
-## Suggested workflow for new behavior
-
-Since iterating on real C firmware (edit → build → flash → reset) is slow,
-prototype new command sequences first with
-[pymavlink](https://github.com/ArduPilot/pymavlink) directly against the FC
-from a PC (no ESP32 involved):
-
-```python
-from pymavlink import mavutil
-m = mavutil.mavlink_connection('/dev/ttyACM0', baud=115200)
-m.wait_heartbeat()
-m.mav.command_long_send(m.target_system, m.target_component,
-    mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE, 0,
-    mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 0, 0, 0, 0, 0, 0)
-print(m.recv_match(type='COMMAND_ACK', blocking=True, timeout=3))
-```
-
-Once a sequence is proven, port it into `g_commands[]` (or a new
-`handle_message()` case, for messages you need to react to) and flash it —
-the deployed ESP32 then runs standalone with no PC/GCS attached.
+The WPA2 key is `CONFIG_MAV_WIFI_PASS` in **both** `sdkconfig.*.defaults`
+files and must be identical in both. The Kconfig default (`password`) is
+only a fallback. To change it, edit both files, delete `sdkconfig.ground`
+and `sdkconfig.drone`, rebuild and reflash both boards.

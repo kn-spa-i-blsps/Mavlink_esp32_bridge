@@ -138,7 +138,7 @@ static void wifi_start(void)
     cfg.ap.ssid_len       = strlen(CONFIG_MAV_WIFI_SSID);
     cfg.ap.channel        = 1;
     cfg.ap.authmode       = WIFI_AUTH_WPA2_PSK;
-    cfg.ap.max_connection = 2;
+    cfg.ap.max_connection = 1;   /* only the drone board may join */
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &cfg));
 #else
@@ -222,6 +222,12 @@ static void udp_to_serial_task(void *arg)
         if (n <= 0) {
             continue;
         }
+#if !CONFIG_MAV_ROLE_GROUND
+        /* only the ground board may talk to the FC */
+        if (from.sin_addr.s_addr != g_peer.sin_addr.s_addr) {
+            continue;
+        }
+#endif
 #if CONFIG_MAV_ROLE_GROUND
         if (!g_peer_known) {
             ESP_LOGI(TAG, "peer found");

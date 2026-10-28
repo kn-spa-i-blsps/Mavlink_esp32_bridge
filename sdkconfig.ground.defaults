@@ -5,3 +5,6 @@ CONFIG_MAV_ROLE_GROUND=y
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
+
+# WPA2 key shared by both boards (must be identical in both *.defaults files)
+CONFIG_MAV_WIFI_PASS="2Tizdqnvajy1rwrI"
