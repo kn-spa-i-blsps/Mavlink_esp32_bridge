@@ -1,0 +1,7 @@
+CONFIG_MAV_ROLE_GROUND=y
+
+# The USB serial port carries raw MAVLink, so nothing else may write to it.
+# Logs stay on UART0.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y

@@ -2,3 +2,6 @@ build/
 sdkconfig.old
 .vscode/
 *.swp
+build*/
+sdkconfig.ground
+sdkconfig.drone

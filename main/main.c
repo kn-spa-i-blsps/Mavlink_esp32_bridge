@@ -1,64 +1,69 @@
 /*
- * ESP32-S3 <-> ArduPilot MAVLink2 bridge (ESP-IDF v5.x)
+ * ESP32-S3 MAVLink <-> WiFi bridge (ESP-IDF)
  *
- * - UART1 on the GPIO matrix (pick free pins), 3.3V TTL straight to a FC TELEM port
- * - Sends HEARTBEAT at 1 Hz  (FC ignores commands from a link it thinks is dead)
- * - Parses RX: locks target sysid/compid from the FC's HEARTBEAT, logs COMMAND_ACK
- * - Once the FC is seen, sends the hardcoded command list below, one every 2s
+ * Two boards running this same firmware replace a pair of telemetry radios:
  *
- * MAVLink C headers (c_library_v2, ardupilotmega dialect) must be added as a component.
- * See notes below the file for CMakeLists + FC-side SERIALn params.
+ *   laptop --USB-- [GROUND: WiFi AP] ~~WiFi/UDP~~ [DRONE: WiFi STA] --UART-- flight controller
+ *
+ * The relay is transparent: raw bytes are passed through without parsing MAVLink,
+ * so QGroundControl / Mission Planner talk to the FC as if wired to it.
+ *
+ * Role is picked at build time (CONFIG_MAV_ROLE_GROUND / CONFIG_MAV_ROLE_DRONE).
  */
 
 #include <string.h>
-#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/uart.h"
-#include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "nvs_flash.h"
+#include "lwip/sockets.h"
 
-#include "ardupilotmega/mavlink.h"   /* superset of common/ — safe for ArduPilot */
+#if CONFIG_MAV_ROLE_GROUND
+#include "driver/usb_serial_jtag.h"
+#else
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#endif
 
-static const char *TAG = "mav";
+static const char *TAG = "bridge";
 
 /* ---- wiring / link config ---- */
 #define MAV_UART        UART_NUM_1
-#define PIN_TX          17          /* S3: avoid strapping (0,3,45,46) & USB (19,20) */
-#define PIN_RX          18
+#define PIN_TX          43          /* XIAO ESP32S3 D6 (labelled TX); GPIO17/18 are not broken out there */
+#define PIN_RX          44          /* XIAO ESP32S3 D7 (labelled RX) */
 #define MAV_BAUD        115200      /* must match SERIALn_BAUD on the FC */
-#define RX_BUF_SIZE     1024
-#define TX_BUF_SIZE     512
+#define SERIAL_BUF_SIZE 1024
 
-/* ---- our identity on the bus ---- */
-#define OWN_SYSID       1                              /* same as vehicle -> treated as onboard */
-#define OWN_COMPID      MAV_COMP_ID_ONBOARD_COMPUTER   /* 191 */
+#define GROUND_IP       "192.168.4.1"   /* default address of the ESP32 access point */
 
-/* learned from the FC's heartbeat before we send anything targeted */
-static uint8_t  g_target_sys   = 0;
-static uint8_t  g_target_comp  = 0;
-static bool     g_link_up      = false;
-static uint32_t g_flight_mode  = 0;   /* HEARTBEAT.custom_mode, refreshed every heartbeat */
+/* ---- serial side: USB to the laptop (ground) or UART to the FC (drone) ---- */
+#if CONFIG_MAV_ROLE_GROUND
 
-/* ArduCopter custom_mode -> human name (see ardupilotmega.h enum COPTER_MODE) */
-static const char *copter_mode_name(uint32_t mode)
+static void serial_init(void)
 {
-    switch (mode) {
-    case COPTER_MODE_STABILIZE: return "STABILIZE";
-    case COPTER_MODE_ACRO:      return "ACRO";
-    case COPTER_MODE_ALT_HOLD:  return "ALT_HOLD";
-    case COPTER_MODE_AUTO:      return "AUTO";
-    case COPTER_MODE_GUIDED:    return "GUIDED";
-    case COPTER_MODE_LOITER:    return "LOITER";
-    case COPTER_MODE_RTL:       return "RTL";
-    case COPTER_MODE_LAND:      return "LAND";
-    case COPTER_MODE_POSHOLD:   return "POSHOLD";
-    case COPTER_MODE_BRAKE:     return "BRAKE";
-    default:                    return "OTHER";
-    }
+    usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    cfg.rx_buffer_size = SERIAL_BUF_SIZE;
+    cfg.tx_buffer_size = SERIAL_BUF_SIZE;
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&cfg));
 }
 
-static void uart_init(void)
+static int serial_read(uint8_t *buf, size_t len, TickType_t wait)
+{
+    return usb_serial_jtag_read_bytes(buf, len, wait);
+}
+
+static void serial_write(const uint8_t *buf, size_t len)
+{
+    /* short timeout so a closed laptop port can't stall the relay */
+    usb_serial_jtag_write_bytes(buf, len, pdMS_TO_TICKS(20));
+}
+
+#else
+
+static void serial_init(void)
 {
     const uart_config_t cfg = {
         .baud_rate = MAV_BAUD,
@@ -68,154 +73,184 @@ static void uart_init(void)
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    ESP_ERROR_CHECK(uart_driver_install(MAV_UART, RX_BUF_SIZE, TX_BUF_SIZE, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_driver_install(MAV_UART, SERIAL_BUF_SIZE, SERIAL_BUF_SIZE, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(MAV_UART, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(MAV_UART, PIN_TX, PIN_RX,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(gpio_set_pull_mode(PIN_RX, GPIO_PULLUP_ONLY));   /* idle high if nothing drives RX */
 }
 
-static void mav_send(const mavlink_message_t *msg)
+static int serial_read(uint8_t *buf, size_t len, TickType_t wait)
 {
-    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-    uint16_t len = mavlink_msg_to_send_buffer(buf, msg);
+    return uart_read_bytes(MAV_UART, buf, len, wait);
+}
+
+static void serial_write(const uint8_t *buf, size_t len)
+{
     uart_write_bytes(MAV_UART, (const char *)buf, len);
 }
 
-static void send_heartbeat(void)
+#endif
+
+/* ---- WiFi: ground is the access point, drone joins it ---- */
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    mavlink_message_t msg;
-    mavlink_msg_heartbeat_pack(OWN_SYSID, OWN_COMPID, &msg,
-        MAV_TYPE_ONBOARD_CONTROLLER,  /* we are a companion, not a GCS or a vehicle */
-        MAV_AUTOPILOT_INVALID,        /* companions must advertise INVALID */
-        0,                            /* base_mode */
-        0,                            /* custom_mode */
-        MAV_STATE_ACTIVE);
-    mav_send(&msg);
+#if CONFIG_MAV_ROLE_GROUND
+    if (id == WIFI_EVENT_AP_STACONNECTED) {
+        ESP_LOGI(TAG, "drone joined the access point");
+    } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
+        ESP_LOGW(TAG, "drone left the access point");
+    }
+#else
+    if (id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "joined '%s'", CONFIG_MAV_WIFI_SSID);
+    } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "WiFi lost, reconnecting");
+        esp_wifi_connect();   /* keep trying forever: the link may drop in flight */
+    }
+#endif
 }
 
-/* One MAV_CMD_* to send via COMMAND_LONG, with its 7 params. */
-typedef struct {
-    uint16_t cmd;
-    float    param[7];
-} mav_cmd_t;
-
-/* ---- hardcoded command sequence -> edit this to whatever the FC should do ---- */
-static const mav_cmd_t g_commands[] = {
-    /* ask the FC to emit AUTOPILOT_VERSION once (harmless, proves the pipe) */
-    { MAV_CMD_REQUEST_MESSAGE, { MAVLINK_MSG_ID_AUTOPILOT_VERSION, 0, 0, 0, 0, 0, 0 } },
-    /* ask the FC to emit SYS_STATUS once */
-    { MAV_CMD_REQUEST_MESSAGE, { MAVLINK_MSG_ID_SYS_STATUS, 0, 0, 0, 0, 0, 0 } },
-    /* stream ATTITUDE (roll/pitch/yaw + timestamp) continuously at 1 Hz */
-    { MAV_CMD_SET_MESSAGE_INTERVAL, { MAVLINK_MSG_ID_ATTITUDE, 1000000, 0, 0, 0, 0, 0 } },
-};
-#define NUM_COMMANDS (sizeof(g_commands) / sizeof(g_commands[0]))
-
-static void send_command(const mav_cmd_t *c)
+static void wifi_start(void)
 {
-    mavlink_message_t msg;
-    mavlink_msg_command_long_pack(OWN_SYSID, OWN_COMPID, &msg,
-        g_target_sys, g_target_comp,
-        c->cmd, 0 /* confirmation */,
-        c->param[0], c->param[1], c->param[2], c->param[3],
-        c->param[4], c->param[5], c->param[6]);
-    mav_send(&msg);
-    ESP_LOGI(TAG, "-> command %u to %u/%u", c->cmd, g_target_sys, g_target_comp);
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    const wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                               wifi_event_handler, NULL));
+
+    wifi_config_t cfg = { 0 };
+#if CONFIG_MAV_ROLE_GROUND
+    esp_netif_create_default_wifi_ap();
+    strlcpy((char *)cfg.ap.ssid, CONFIG_MAV_WIFI_SSID, sizeof(cfg.ap.ssid));
+    strlcpy((char *)cfg.ap.password, CONFIG_MAV_WIFI_PASS, sizeof(cfg.ap.password));
+    cfg.ap.ssid_len       = strlen(CONFIG_MAV_WIFI_SSID);
+    cfg.ap.channel        = 1;
+    cfg.ap.authmode       = WIFI_AUTH_WPA2_PSK;
+    cfg.ap.max_connection = 2;
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &cfg));
+#else
+    esp_netif_create_default_wifi_sta();
+    strlcpy((char *)cfg.sta.ssid, CONFIG_MAV_WIFI_SSID, sizeof(cfg.sta.ssid));
+    strlcpy((char *)cfg.sta.password, CONFIG_MAV_WIFI_PASS, sizeof(cfg.sta.password));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
+#endif
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));   /* power save adds latency */
 }
 
-static void handle_message(const mavlink_message_t *msg)
+/* ---- UDP side ---- */
+static int                g_sock = -1;
+static struct sockaddr_in g_peer;
+static volatile bool      g_peer_known = false;
+
+static void udp_init(void)
 {
-    switch (msg->msgid) {
+    g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    ESP_ERROR_CHECK(g_sock < 0 ? ESP_FAIL : ESP_OK);
 
-    case MAVLINK_MSG_ID_HEARTBEAT: {
-        /* Only the autopilot component (compid 1), not other GCS/companions on the bus */
-        if (msg->compid != MAV_COMP_ID_AUTOPILOT1) {
-            break;
-        }
-        mavlink_heartbeat_t hb;
-        mavlink_msg_heartbeat_decode(msg, &hb);
-        g_flight_mode = hb.custom_mode;   /* refreshed every heartbeat, not just the first */
+    const struct sockaddr_in local = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(CONFIG_MAV_UDP_PORT),
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+    };
+    ESP_ERROR_CHECK(bind(g_sock, (const struct sockaddr *)&local, sizeof(local)) < 0
+                    ? ESP_FAIL : ESP_OK);
 
-        if (!g_link_up) {
-            g_target_sys  = msg->sysid;
-            g_target_comp = msg->compid;
-            g_link_up     = true;
-            ESP_LOGI(TAG, "FC heartbeat: sys=%u comp=%u type=%u ap=%u -> link up",
-                     g_target_sys, g_target_comp, hb.type, hb.autopilot);
-        }
-        break;
-    }
-
-    case MAVLINK_MSG_ID_ATTITUDE: {
-        mavlink_attitude_t att;
-        mavlink_msg_attitude_decode(msg, &att);
-        ESP_LOGI(TAG, "ATTITUDE t=%lu ms roll=%.1f pitch=%.1f yaw=%.1f deg mode=%s",
-                 (unsigned long)att.time_boot_ms,
-                 att.roll  * (180.0f / (float)M_PI),
-                 att.pitch * (180.0f / (float)M_PI),
-                 att.yaw   * (180.0f / (float)M_PI),
-                 copter_mode_name(g_flight_mode));
-        break;
-    }
-
-    case MAVLINK_MSG_ID_COMMAND_ACK: {
-        mavlink_command_ack_t ack;
-        mavlink_msg_command_ack_decode(msg, &ack);
-        ESP_LOGI(TAG, "COMMAND_ACK cmd=%u result=%u", ack.command, ack.result);
-        /* Real code: on MAV_RESULT_TEMPORARILY_REJECTED -> back off and retry */
-        break;
-    }
-
-    case MAVLINK_MSG_ID_AUTOPILOT_VERSION: {
-        mavlink_autopilot_version_t v;
-        mavlink_msg_autopilot_version_decode(msg, &v);
-        ESP_LOGI(TAG, "AUTOPILOT_VERSION flight_sw=0x%08lx", (unsigned long)v.flight_sw_version);
-        break;
-    }
-
-    default:
-        break;
-    }
+#if !CONFIG_MAV_ROLE_GROUND
+    /* the drone always sends to the ground board; the ground board learns the
+     * drone's address from the first packet it receives */
+    g_peer.sin_family = AF_INET;
+    g_peer.sin_port   = htons(CONFIG_MAV_UDP_PORT);
+    inet_pton(AF_INET, GROUND_IP, &g_peer.sin_addr);
+    g_peer_known = true;
+#endif
 }
 
-static void mavlink_task(void *arg)
+/* serial side -> WiFi */
+static void serial_to_udp_task(void *arg)
 {
-    uart_init();
-
-    mavlink_message_t rx_msg;
-    mavlink_status_t  rx_status;
     uint8_t buf[256];
-
-    int64_t last_hb_us  = 0;
-    int64_t last_cmd_us = 0;
-    size_t  next_cmd    = 0;
-
-    while (1) {
-        /* --- RX: drain whatever is available, parse byte by byte --- */
-        int n = uart_read_bytes(MAV_UART, buf, sizeof(buf), pdMS_TO_TICKS(20));
-        for (int i = 0; i < n; i++) {
-            if (mavlink_parse_char(MAVLINK_COMM_0, buf[i], &rx_msg, &rx_status)) {
-                handle_message(&rx_msg);
+#if !CONFIG_MAV_ROLE_GROUND
+    uint32_t rx_bytes = 0;
+    TickType_t last_report = xTaskGetTickCount();
+#endif
+    for (;;) {
+        int n = serial_read(buf, sizeof(buf), pdMS_TO_TICKS(10));
+#if !CONFIG_MAV_ROLE_GROUND
+        if (n > 0) {
+            rx_bytes += n;
+        }
+        if (xTaskGetTickCount() - last_report >= pdMS_TO_TICKS(2000)) {
+            if (rx_bytes) {
+                ESP_LOGI(TAG, "FC -> %u bytes in the last 2 s", (unsigned)rx_bytes);
+            } else {
+                ESP_LOGW(TAG, "nothing from the FC in the last 2 s (wiring? SERIALn params?) RX pin=%d",
+                         gpio_get_level(PIN_RX));
             }
+            rx_bytes = 0;
+            last_report = xTaskGetTickCount();
         }
-
-        int64_t now = esp_timer_get_time();
-
-        /* --- 1 Hz heartbeat --- */
-        if (now - last_hb_us >= 1000000) {
-            send_heartbeat();
-            last_hb_us = now;
+#endif
+        if (n > 0 && g_peer_known) {
+            sendto(g_sock, buf, n, 0, (const struct sockaddr *)&g_peer, sizeof(g_peer));
         }
+    }
+}
 
-        /* --- walk the hardcoded command list, one every 2 s, once the FC is known --- */
-        if (g_link_up && next_cmd < NUM_COMMANDS && now - last_cmd_us >= 2000000) {
-            send_command(&g_commands[next_cmd]);
-            next_cmd++;
-            last_cmd_us = now;
+/* WiFi -> serial side */
+static void udp_to_serial_task(void *arg)
+{
+    uint8_t buf[512];
+    for (;;) {
+        struct sockaddr_in from;
+        socklen_t from_len = sizeof(from);
+        int n = recvfrom(g_sock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
+        if (n <= 0) {
+            continue;
         }
+#if CONFIG_MAV_ROLE_GROUND
+        if (!g_peer_known) {
+            ESP_LOGI(TAG, "peer found");
+        }
+        g_peer       = from;
+        g_peer_known = true;
+#endif
+#if !CONFIG_MAV_ROLE_GROUND
+        static int logged = 0;
+        if (logged < 5) {   /* first few packets only: proves WiFi -> UART TX is reached */
+            ESP_LOGI(TAG, "UDP -> UART TX: %d bytes", n);
+            logged++;
+        }
+#endif
+        serial_write(buf, n);
     }
 }
 
 void app_main(void)
 {
-    xTaskCreate(mavlink_task, "mavlink", 4096, NULL, 5, NULL);
+#if CONFIG_MAV_ROLE_GROUND
+    ESP_LOGI(TAG, "role: GROUND (access point '%s', USB serial to laptop)", CONFIG_MAV_WIFI_SSID);
+#else
+    ESP_LOGI(TAG, "role: DRONE (joins '%s', UART to flight controller)", CONFIG_MAV_WIFI_SSID);
+#endif
+    serial_init();
+    wifi_start();
+    udp_init();
+
+    xTaskCreate(serial_to_udp_task, "ser2udp", 4096, NULL, 5, NULL);
+    xTaskCreate(udp_to_serial_task, "udp2ser", 4096, NULL, 5, NULL);
 }

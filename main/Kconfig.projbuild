@@ -1,0 +1,28 @@
+menu "MAVLink WiFi bridge"
+
+    choice MAV_ROLE
+        prompt "Board role"
+        default MAV_ROLE_DRONE
+        help
+            GROUND: WiFi access point, relays to the laptop over USB serial.
+            DRONE:  joins the access point, relays to the flight controller over UART.
+
+        config MAV_ROLE_GROUND
+            bool "Ground (access point <-> USB to laptop)"
+        config MAV_ROLE_DRONE
+            bool "Drone (station <-> UART to flight controller)"
+    endchoice
+
+    config MAV_WIFI_SSID
+        string "WiFi network name"
+        default "mavbridge"
+
+    config MAV_WIFI_PASS
+        string "WiFi password (8+ characters)"
+        default "password"
+
+    config MAV_UDP_PORT
+        int "UDP port"
+        default 14550
+
+endmenu
